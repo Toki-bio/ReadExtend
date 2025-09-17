@@ -84,6 +84,11 @@ for f in "$READS" "$SEED"; do
     fi
 done
 
+# DEPENDENCY CHECK
+for cmd in seqkit mafft awk grep; do
+    command -v "$cmd" >/dev/null || { echo "ERROR: $cmd required but not found." >&2; exit 1; }
+done
+
 # MAKE WORKDIR
 mkdir -p "$WORKDIR"
 cd "$WORKDIR"
@@ -95,9 +100,6 @@ log() {
 }
 
 cleanup() {
-    # Uncomment to keep intermediates for debugging
-    # log "Working files kept in: $WORKDIR"
-    # return
     cd ..
     rm -rf "$WORKDIR"
 }
@@ -125,12 +127,12 @@ extend_direction() {
 
     # Prepare bank
     log "Shuffling and splitting reads..."
-    seqkit shuffle "$READS" > shuf.bnk 2>/dev/null
+    seqkit shuffle "../$READS" > shuf.bnk 2>/dev/null
     seqkit split -p 20 -O ./ shuf.bnk >/dev/null 2>&1
 
     local k=1
-    local current_seed="$SEED_FILE"
     local NumberHits=0
+    local EXT=""
 
     while [[ $k -le $MAX_ROUNDS ]]; do
         log "Round $k of $MAX_ROUNDS ($DIR)"
@@ -173,7 +175,7 @@ extend_direction() {
         if [[ "$QUIET" == true ]]; then
             mafft --thread $THREADS --adjustdirection --reorder "finds_$k.bnk" > "finds_$k.al" 2>/dev/null
         else
-            mafft --thread $THREADS --adjustdirection --reorder "finds_$k.al" 2>/dev/null
+            mafft --thread $THREADS --adjustdirection --reorder "finds_$k.bnk" > "finds_$k.al"
         fi
 
         if [[ ! -s "finds_$k.al" ]]; then
@@ -193,19 +195,15 @@ extend_direction() {
         fi
 
         if [[ "$DIR" == "right" ]]; then
-            # Find last non-gap position in seed row
             GapLen=$(awk 'NR==2 { match($0, /-+$/); print RLENGTH+0 }' "finds_$k.al")
             Pos=$((SeqLen - GapLen + 1))
-            # Extract FLANK_LEN to the right
             seqkit subseq -r $Pos:$((Pos + FLANK_LEN - 1)) "finds_$k.al" | \
             seqkit seq --min-len 5 -g | \
             seqkit sort -l | \
             seqkit range -r -1:-1 > "newquery_$k.q"
         else
-            # left: find leading gaps in seed
             GapLen=$(awk 'NR==2 { match($0, /^-+/); print RLENGTH+0 }' "finds_$k.al")
             Pos=$((GapLen + 1))
-            # Extract FLANK_LEN to the left (before seed start)
             seqkit subseq -r 1:$((Pos - 1)) "finds_$k.al" | \
             seqkit seq --min-len 5 -g | \
             seqkit sort -l | \
@@ -218,17 +216,25 @@ extend_direction() {
         fi
 
         query=$(awk 'NR==2' "newquery_$k.q")
+        if [[ "$DIR" == "right" ]]; then
+            EXT="${EXT}${query}"
+        else
+            EXT="${query}${EXT}"
+        fi
+
         cp "newquery_$k.q" "${PREFIX}_round${k}.q"
         log "New query ($DIR): ${query:0:50}..."
 
         let k++
     done
 
-    # Return last query file if exists
-    if [[ -f "${PREFIX}_round$((k-1)).q" ]]; then
-        echo "${PREFIX}_round$((k-1)).q"
+    # Return extension file if any
+    if [[ -n "$EXT" ]]; then
+        echo ">ext_${DIR}" > "${PREFIX}_ext.q"
+        echo "$EXT" >> "${PREFIX}_ext.q"
+        echo "${PREFIX}_ext.q"
     else
-        echo "$SEED_FILE"
+        echo ""
     fi
 }
 
@@ -245,38 +251,32 @@ log "Max hits: $MAX_HITS"
 log "Flank length: $FLANK_LEN"
 
 cp "$SEED" "seed_init.q"
+SEED_SEQ=$(awk 'NR==2' "seed_init.q")
+
+LEFT_EXT=""
+RIGHT_EXT=""
 
 if [[ "$DIRECTION" == "left" || "$DIRECTION" == "both" ]]; then
     log ">>> Starting LEFT extension..."
     LEFT_FINAL=$(extend_direction "left" "seed_init.q" "left")
-    cp "$LEFT_FINAL" "left_final.q"
+    if [[ -n "$LEFT_FINAL" ]]; then
+        LEFT_EXT=$(awk 'NR==2' "$LEFT_FINAL")
+    fi
 fi
 
 if [[ "$DIRECTION" == "right" || "$DIRECTION" == "both" ]]; then
     log ">>> Starting RIGHT extension..."
     RIGHT_FINAL=$(extend_direction "right" "seed_init.q" "right")
-    cp "$RIGHT_FINAL" "right_final.q"
+    if [[ -n "$RIGHT_FINAL" ]]; then
+        RIGHT_EXT=$(awk 'NR==2' "$RIGHT_FINAL")
+    fi
 fi
 
 # STITCH
-if [[ "$DIRECTION" == "both" ]]; then
-    LEFT_SEQ=$(awk 'NR==2' "left_final.q" 2>/dev/null || "")
-    SEED_SEQ=$(awk 'NR==2' "$SEED" 2>/dev/null || "")
-    RIGHT_SEQ=$(awk 'NR==2' "right_final.q" 2>/dev/null || "")
-
-    if [[ -n "$LEFT_SEQ" && -n "$SEED_SEQ" && -n "$RIGHT_SEQ" ]]; then
-        echo ">$(basename "$OUT" .fa)" > "../$OUT"
-        echo "$LEFT_SEQ$SEED_SEQ$RIGHT_SEQ" >> "../$OUT"
-        log "Stitched left + seed + right"
-    else
-        log "WARNING: Could not stitch — outputting right extension only"
-        cp "right_final.q" "../$OUT"
-    fi
-elif [[ "$DIRECTION" == "left" ]]; then
-    cp "left_final.q" "../$OUT"
-elif [[ "$DIRECTION" == "right" ]]; then
-    cp "right_final.q" "../$OUT"
-fi
+{
+    echo ">$(basename "$OUT" .fa)_extended"
+    echo "${LEFT_EXT}${SEED_SEQ}${RIGHT_EXT}"
+} > "../$OUT"
 
 log "Output written to: ../$OUT"
 log "=== readwalk.sh finished ==="
